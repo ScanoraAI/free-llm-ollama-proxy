@@ -1,13 +1,9 @@
 {
   "name": "free-llm-ollama-proxy",
   "version": "1.0.0",
-  "description": "OpenAI-compatible proxy for Ollama (self-hosted LLMs) - GoDaddy optimized",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "dependencies": {
-    "express": "^4.18.2",
-    "axios": "^1.7.2"
-  }
+  "dependencies": {}
 }

@@ -1,97 +1,125 @@
-const express = require('express');
-const axios = require('axios');
+// Ollama Proxy - GoDaddy compatible (minimal version)
+const http = require('http');
+const https = require('https');
 
-// Error handling
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('[ERROR] Unhandled Rejection at:', reason);
+const PORT = process.env.PORT || 3000;
+const HOST = '0.0.0.0';
+
+function makeRequest(url, options, body) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith('https') ? https : http;
+    const data = body ? JSON.stringify(body) : null;
+    
+    const req = lib.request(url, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {})
+      }
+    }, (res) => {
+      let responseBody = '';
+      res.on('data', chunk => responseBody += chunk);
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(responseBody));
+        } catch (e) {
+          reject(new Error('Invalid JSON response'));
+        }
+      });
+    });
+    
+    req.on('error', reject);
+    req.setTimeout(30000, () => req.destroy());
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
+
+const server = http.createServer((req, res) => {
+  const handleResponse = (data, status = 200) => {
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(data));
+  };
+
+  if (req.url === '/health' || req.url === '/') {
+    return handleResponse({ 
+      status: 'ok',
+      ollama_url: OLLAMA_URL,
+      node_version: process.version
+    });
+  }
+
+  if (req.url === '/v1/models') {
+    makeRequest(`${OLLAMA_URL}/api/tags`, { method: 'GET' })
+      .then(data => {
+        const models = (data.models || []).map(m => ({
+          id: m.name,
+          object: 'model'
+        }));
+        handleResponse({ data: models });
+      })
+      .catch(err => handleResponse({ 
+        error: 'Failed to list models', 
+        detail: err.message 
+      }, 502));
+    return;
+  }
+
+  if (req.url === '/v1/chat/completions' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body);
+        const { messages, model = 'phi3', max_tokens = 2048, temperature = 0.7 } = payload;
+        
+        makeRequest(`${OLLAMA_URL}/api/generate`, { method: 'POST' }, {
+          model: model,
+          prompt: messages.map(m => `${m.role}: ${m.content}`).join('\n'),
+          stream: false,
+          options: {
+            num_predict: Math.min(max_tokens, 2000),
+            temperature: temperature,
+            top_p: 0.9
+          }
+        }).then(data => {
+          handleResponse({
+            id: `chatcmpl-${Date.now()}`,
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model: model,
+            choices: [{
+              index: 0,
+              message: { role: 'assistant', content: data.response || '' },
+              finish_reason: 'stop'
+            }]
+          });
+        }).catch(err => handleResponse({
+          error: 'Failed to connect to Ollama',
+          detail: err.message
+        }, 502));
+      } catch (err) {
+        handleResponse({ error: 'Invalid JSON', detail: err.message }, 400);
+      }
+    });
+    return;
+  }
+
+  handleResponse({ error: 'Not found' }, 404);
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`Ollama Proxy running on ${HOST}:${PORT}`);
+  console.log(`Ollama endpoint: ${OLLAMA_URL}`);
+  console.log(`Node version: ${process.version}`);
 });
 
 process.on('uncaughtException', (err) => {
-  console.error('[ERROR] Uncaught Exception:', err);
-  process.exit(1);
+  console.error('[ERROR] Uncaught exception:', err.message);
 });
 
-const app = express();
-app.use(express.json({limit: '1mb'}));
-
-const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
-const DEFAULT_MODEL = process.env.OLLAMA_MODEL || 'phi3';
-
-// Health check - doesn't require Ollama connection
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    ollama_url: OLLAMA_URL, 
-    default_model: DEFAULT_MODEL,
-    node_version: process.version 
-  });
-});
-
-// Models endpoint
-app.get('/v1/models', async (req, res) => {
-  try {
-    const resp = await axios.get(`${OLLAMA_URL}/api/tags`, { timeout: 5000 });
-    const models = resp.data.models?.map(m => ({
-      id: m.name,
-      object: 'model',
-      owned_by: 'ollama'
-    })) || [];
-    res.json({ data: models });
-  } catch (err) {
-    res.status(502).json({ error: 'Failed to list models', detail: err.message });
-  }
-});
-
-// Chat completions - proxy to Ollama
-app.post('/v1/chat/completions', express.json({limit: '1mb'}), async (req, res) => {
-  try {
-    const { messages, model, max_tokens = 2048, temperature = 0.7 } = req.body;
-    
-    const ollamaPayload = {
-      model: model || DEFAULT_MODEL,
-      prompt: messages.map(m => `${m.role}: ${m.content}`).join('\n'),
-      stream: false,
-      options: {
-        num_predict: Math.min(max_tokens, 2000),
-        temperature: temperature,
-        top_p: 0.9
-      }
-    };
-
-    console.log(`[INFO] Proxying to Ollama: ${OLLAMA_URL}`);
-    const response = await axios.post(`${OLLAMA_URL}/api/generate`, ollamaPayload, {
-      timeout: 60000,
-      maxContentLength: 10 * 1024 * 1024,
-    });
-
-    res.json({
-      id: `chatcmpl-${Date.now()}`,
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model: ollamaPayload.model,
-      choices: [{
-        index: 0,
-        message: { 
-          role: 'assistant', 
-          content: response.data.response || '' 
-        },
-        finish_reason: 'stop'
-      }]
-    });
-  } catch (err) {
-    console.error('[ERROR] Proxy error:', err.response?.data || err.message);
-    res.status(502).json({ 
-      error: 'Failed to connect to Ollama', 
-      detail: err.message 
-    });
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || '0.0.0.0';
-
-app.listen(PORT, HOST, () => {
-  console.log(`[INFO] Ollama Proxy listening on ${HOST}:${PORT}`);
-  console.log(`[INFO] Ollama endpoint: ${OLLAMA_URL}`);
-  console.log(`[INFO] Node version: ${process.version}`);
+process.on('unhandledRejection', (reason) => {
+  console.error('[ERROR] Unhandled rejection:', reason);
 });
