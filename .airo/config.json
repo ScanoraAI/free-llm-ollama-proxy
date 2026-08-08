@@ -1,4 +1,0 @@
-{
-  "serveCommand": "node server.js",
-  "buildCommand": "echo 'No build needed for minimal server'"
-}
